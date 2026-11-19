@@ -309,6 +309,15 @@ class HFModelWrapper(nn.Module):
             self.model = pretrain_or_model
 
         self._gdn_layers = gated_delta_net_layers(self.model)
+        if any(type(gdn).__name__ == "Qwen3_5GatedDeltaNet" and gdn.head_k_dim == 128 for gdn in self._gdn_layers):
+            import triton
+            from fla.modules.l2norm import l2norm_bwd_kernel
+
+            # Length-dependent autotuning can launch spilling candidates during backward,
+            # when optimizer state and activations already occupy most of the GPU. This
+            # configuration has no spills on A100; one candidate bypasses autotuning.
+            l2norm_bwd_kernel.configs = [triton.Config({"BT": 8}, num_warps=4)]
+            logger.info("Qwen3.5 l2norm backward: fixed BT=8, num_warps=4 (no autotuning)")
         # Ulysses shards the sequence dimension; a Gated DeltaNet layer runs its conv and
         # recurrence left to right, so it cannot be split across ranks even without packing.
         if self._gdn_layers and self.sequence_parallel_size > 1:
