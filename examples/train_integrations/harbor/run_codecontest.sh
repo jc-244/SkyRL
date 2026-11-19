@@ -3,10 +3,8 @@ set -ex
 # wandb api key.
 # export WANDB_API_KEY=YOUR_KEY_HERE
 
-# Pick the sandbox provider and provide the credentials.
-# export DAYTONA_API_KEY=YOUR_KEY_HERE
-# export MODAL_TOKEN_ID=YOUR_KEY_HERE
-# export MODAL_TOKEN_SECRET=YOUR_KEY_HERE
+# Use the local Docker daemon configured in harbor_trial_config/default.yaml.
+# For rootless Docker, export DOCKER_HOST before starting Ray and training.
 
 #-----------------------
 # Dataset setup
@@ -22,11 +20,13 @@ EVAL_DATA="['$DATA_DIR/OpenThoughts-TB-dev']"
 # Directory setup
 #-----------------------
 RUN_NAME="codecontest"
-STORAGE_ROOT="/mnt/local_storage/$RUN_NAME"
+STORAGE_ROOT="${STORAGE_ROOT:-/local/data/$(id -un)/skyrl_runs/$RUN_NAME}"
 TRIALS_DIR="$STORAGE_ROOT/trials_run"
 CKPTS_DIR="$STORAGE_ROOT/ckpts"
 EXPORTS_DIR="$STORAGE_ROOT/exports"
 LOG_DIR="$STORAGE_ROOT/logs"
+mkdir -p "$TRIALS_DIR" "$CKPTS_DIR" "$EXPORTS_DIR" "$LOG_DIR"
+export WANDB_DIR="$LOG_DIR"
 
 #-----------------------
 # Training setup
@@ -34,6 +34,10 @@ LOG_DIR="$STORAGE_ROOT/logs"
 N_SAMPLES_PER_PROMPT=8
 MINI_BATCH_SIZE=32
 MAX_MODEL_LEN=32768
+# Pack variable-length trajectories by token count for forward and training passes.
+MAX_TOKENS_PER_MICROBATCH=32768
+# HF exports accumulate separately from the retained training checkpoints.
+HF_SAVE_INTERVAL=100
 
 # Algorithmic parameters
 LOSS_REDUCTION="token_mean"  # with step-wise training, we have to use token_mean to be prefix-merge-invariant
@@ -57,9 +61,13 @@ TIS_IMP_RATIO_CAP=2.0
 NUM_POLICY_GPUS=8
 NUM_INFERENCE_ENGINES=4
 TP_SIZE=2
+# Upstream inference defaults.
+INFERENCE_GPU_MEMORY_UTILIZATION=0.8
+INFERENCE_MAX_NUM_SEQS=1024
+INFERENCE_MAX_NUM_BATCHED_TOKENS=8192
 ENABLE_RATE_LIMITING=true  # Enable rate/concurrency limiting for trajectory submissions
 TRAJECTORIES_PER_SECOND=5  # Maximum trajectories per second (must be >= 1.0, fractional values like 1.5 are supported). null or omit to disable rate limiting
-MAX_CONCURRENCY=512        # Maximum concurrent trial.run() calls allowed (must be >= 1). null or omit to disable concurrency limiting
+MAX_CONCURRENCY=512        # Maximum concurrent trial.run() calls.
 
 # Run SkyRL command
 uv run --isolated --extra fsdp --extra harbor -m examples.train_integrations.harbor.entrypoints.main_harbor \
@@ -97,9 +105,10 @@ uv run --isolated --extra fsdp --extra harbor -m examples.train_integrations.har
   trainer.policy_mini_batch_size=$MINI_BATCH_SIZE \
   trainer.micro_forward_batch_size_per_gpu=1 \
   trainer.micro_train_batch_size_per_gpu=1 \
+  trainer.max_tokens_per_microbatch=$MAX_TOKENS_PER_MICROBATCH \
   trainer.ckpt_interval=5 \
   trainer.max_ckpts_to_keep=5 \
-  trainer.hf_save_interval=5 \
+  trainer.hf_save_interval=$HF_SAVE_INTERVAL \
   trainer.algorithm.max_seq_len=$MAX_MODEL_LEN \
   trainer.policy.optimizer_config.lr=1.0e-6 \
   generator.step_wise_trajectories=true \
@@ -107,7 +116,9 @@ uv run --isolated --extra fsdp --extra harbor -m examples.train_integrations.har
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   generator.eval_n_samples_per_prompt=2 \
   generator.apply_overlong_filtering=$APPLY_OVERLONG_FILTERING \
-  generator.inference_engine.gpu_memory_utilization=0.8 \
+  generator.inference_engine.gpu_memory_utilization=$INFERENCE_GPU_MEMORY_UTILIZATION \
+  generator.inference_engine.max_num_seqs=$INFERENCE_MAX_NUM_SEQS \
+  generator.inference_engine.max_num_batched_tokens=$INFERENCE_MAX_NUM_BATCHED_TOKENS \
   trainer.logger=wandb \
   trainer.project_name=harbor \
   trainer.run_name=$RUN_NAME \

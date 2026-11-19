@@ -1,0 +1,7 @@
+# Docker Engine >= 29 automatically chooses an unused /24 from its address pools.
+# Smaller subnets support hundreds of isolated trials without exhausting the pools.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 0.0.0.0/24
