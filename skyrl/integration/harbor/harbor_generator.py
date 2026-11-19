@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import List, Optional
 from uuid import uuid4
 
@@ -18,6 +18,15 @@ from tqdm import tqdm
 from skyrl.backends.skyrl_train.inference_servers.base import (
     ConversationType,
     InferenceEngineInterface,
+)
+from skyrl.integration.harbor.remote import (
+    RemoteHarborConfig,
+    map_task_path,
+    run_remote_trial,
+)
+from skyrl.integration.harbor.rollout_adapter import (
+    RolloutContractError,
+    extract_rollout,
 )
 from skyrl.integration.harbor.trial_metrics import TrialAttempts, trial_metrics
 from skyrl.train.generators.base import (
@@ -53,12 +62,16 @@ class HarborTrajectoryOutput:
     rollout_details: Optional[List[RolloutDetail]] = None
     reward: float = 0.0
     num_turns: int = 0
-    # One of: "complete", "context_length", "agent_timeout", "error". Used by
+    # One of: "complete", "context_length", "search_limits_exhausted", "environment_error", "agent_timeout", "error". Used by
     # `build_step_wise_generator_output` to decide whether to skip the entire prompt group.
     stop_reason: str = "complete"
     # End-to-end wall-clock time (seconds) to generate this trajectory. Optional: left as None if
     # timing was not recorded.
     e2e_time: Optional[float] = None
+    # Preserve the remote failure details for evaluation records and diagnosis.
+    exception_info: Optional[dict] = None
+    # Optional advantages from the remote credit service, one per LLM turn.
+    step_advantages: Optional[List[float]] = None
 
 
 def build_step_wise_generator_output(
@@ -70,8 +83,14 @@ def build_step_wise_generator_output(
     ``is_last_step=True``. Failures (timeout / unknown error / empty rollout
     details) are batched per ``instance_id``: if any rollout for prompt P
     failed, all rollouts for P are replaced with single zeroed-out
-    placeholder steps.
+    placeholder steps. Context-length, search-limit and environment-state failures mask only their own trajectory;
+    remote searches without partial tokens use a single masked placeholder.
     """
+    use_step_advantages = any(t.step_advantages is not None for t in trajectory_outputs)
+    if use_step_advantages and any(t.step_advantages is None for t in trajectory_outputs):
+        raise ValueError("Cannot mix remote and reward-based advantages in one batch")
+    step_advantages: List[float] = []
+
     # 1. Identify failed instances. If any rollout for prompt P failed, mask all rollouts for P (conservative).
     timeout_instance_ids = set()
     error_instance_ids = set()
@@ -84,7 +103,10 @@ def build_step_wise_generator_output(
         if traj.stop_reason == "agent_timeout":
             num_timeout_trajectories += 1
             timeout_instance_ids.add(instance_id)
-        elif traj.stop_reason == "error" or traj.rollout_details is None:
+        elif traj.stop_reason == "error" or (
+            traj.rollout_details is None
+            and traj.stop_reason not in {"context_length", "search_limits_exhausted", "environment_error"}
+        ):
             num_error_trajectories += 1
             error_instance_ids.add(instance_id)
     masked_instance_ids = timeout_instance_ids | error_instance_ids
@@ -93,6 +115,7 @@ def build_step_wise_generator_output(
     prompt_token_ids: List[List[int]] = []
     response_ids: List[List[int]] = []
     rewards: List[float] = []
+    reward_valid: List[bool] = []
     loss_masks: List[List[int]] = []
     stop_reasons: List[str] = []
     is_last_step_list: List[bool] = []
@@ -111,17 +134,27 @@ def build_step_wise_generator_output(
     for traj in trajectory_outputs:
         tid = traj.trajectory_id
 
-        # 2.1. For failed trajectories, set loss mask to [0] and stop reason to "error".
-        if tid.instance_id in masked_instance_ids:
+        # 2.1. Keep a reward slot even when a search returned no partial tokens.
+        masked_group = tid.instance_id in masked_instance_ids
+        if (
+            masked_group
+            or traj.stop_reason in {"search_limits_exhausted", "environment_error"}
+            or (traj.stop_reason == "context_length" and not traj.rollout_details)
+        ):
             prompt_token_ids.append([0])
             response_ids.append([0])
             rewards.append(0.0)
+            # Infrastructure failures have no measured outcome. Budget/context stops
+            # retain their task-defined zero reward even when no tokens can train.
+            reward_valid.append(not masked_group and traj.stop_reason != "environment_error")
             loss_masks.append([0])
-            stop_reasons.append("error")
+            stop_reasons.append("error" if masked_group else traj.stop_reason)
             is_last_step_list.append(True)
             out_trajectory_ids.append(tid)
             rollout_logprobs_list.append([0.0])
             out_trajectory_generation_times.append(traj.e2e_time)
+            if use_step_advantages:
+                step_advantages.append(0.0)
             continue
 
         # 2.2. For successful trajectories, emit one entry per step.
@@ -136,6 +169,8 @@ def build_step_wise_generator_output(
         completion_token_ids_per_turn = rollout_detail["completion_token_ids"]
         logprobs_per_turn = rollout_detail["logprobs"]
         n_turns = len(completion_token_ids_per_turn)
+        if use_step_advantages and len(traj.step_advantages) != n_turns:
+            raise ValueError("Remote advantages must match the rollout's turns")
         assert len(prompt_token_ids_per_turn) == n_turns and len(logprobs_per_turn) == n_turns, (
             f"Malformed rollout_details (prompts={len(prompt_token_ids_per_turn)}, completions={n_turns}, "
             f"logprobs={len(logprobs_per_turn)})."
@@ -163,6 +198,7 @@ def build_step_wise_generator_output(
             prompt_token_ids.append(p_ids)
             response_ids.append(comp_ids)
             rewards.append(reward)
+            reward_valid.append(True)
             loss_masks.append(step_loss_mask)
             stop_reasons.append(step_stop_reason)
             is_last_step_list.append(is_last)
@@ -170,6 +206,8 @@ def build_step_wise_generator_output(
             rollout_logprobs_list.append(lp)
             # For trajectory completion per turn we just use the trajectory-level e2e time.
             out_trajectory_generation_times.append(traj.e2e_time)
+            if use_step_advantages:
+                step_advantages.append(traj.step_advantages[t] if any(step_loss_mask) else 0.0)
 
         # 2.5. For trajectory-level metrics, record the last turn's prompt IDs and response IDs which
         # contains the entire trajectory.
@@ -191,9 +229,6 @@ def build_step_wise_generator_output(
             rewards_for_metrics,
             trajectory_completion_times=trajectory_generation_times_per_prompt,
         )
-        rollout_metrics["generate/trajectories_context_length_exceeded"] = sum(
-            1 for t in successful_trajectories if t.stop_reason == "context_length"
-        )
         rollout_metrics["generate/avg_num_turns"] = sum(t.num_turns for t in successful_trajectories) / len(
             successful_trajectories
         )
@@ -203,11 +238,21 @@ def build_step_wise_generator_output(
     rollout_metrics["generate/num_timeout_trajectories"] = num_timeout_trajectories
     rollout_metrics["generate/num_error_trajectories"] = num_error_trajectories
     rollout_metrics["generate/num_masked_instances"] = len(masked_instance_ids)
+    rollout_metrics["generate/trajectories_context_length_exceeded"] = sum(
+        t.stop_reason == "context_length" for t in trajectory_outputs
+    )
+    rollout_metrics["generate/trajectories_search_limits_exhausted"] = sum(
+        t.stop_reason == "search_limits_exhausted" for t in trajectory_outputs
+    )
+    rollout_metrics["generate/trajectories_environment_error"] = sum(
+        t.stop_reason == "environment_error" for t in trajectory_outputs
+    )
 
-    return GeneratorOutput(
+    output = GeneratorOutput(
         prompt_token_ids=prompt_token_ids,
         response_ids=response_ids,
         rewards=rewards,
+        reward_valid=reward_valid,
         loss_masks=loss_masks,
         stop_reasons=stop_reasons,
         rollout_metrics=rollout_metrics,
@@ -217,6 +262,9 @@ def build_step_wise_generator_output(
         # Per-step times, aligned 1:1 with the flattened per-step arrays above.
         trajectory_generation_times=out_trajectory_generation_times,
     )
+    if use_step_advantages:
+        output["step_advantages"] = step_advantages
+    return output
 
 
 class HarborGenerator(GeneratorInterface):
@@ -244,6 +292,20 @@ class HarborGenerator(GeneratorInterface):
                 "sample-support replay, or set generator.inference_engine.enable_return_sample_support_set=false."
             )
         self.base_url = inference_engine_client.get_endpoint_url()
+        remote_cfg = getattr(generator_cfg, "remote", None)
+        self.remote = (
+            RemoteHarborConfig(**(asdict(remote_cfg) if is_dataclass(remote_cfg) else dict(remote_cfg)))
+            if remote_cfg is not None
+            else RemoteHarborConfig()
+        )
+        if self.remote.endpoint and not all(
+            (
+                self.remote.inference_url,
+                self.remote.local_task_root,
+                self.remote.remote_task_root,
+            )
+        ):
+            raise ValueError("Remote Harbor requires inference_url, local_task_root and remote_task_root")
         # Kept so we can notify the router when a session (trial attempt) ends,
         # which lets session-aware routing policies rebalance new trajectories.
         self.inference_engine_client = inference_engine_client
@@ -274,7 +336,9 @@ class HarborGenerator(GeneratorInterface):
         self._harbor_trial_config_template.setdefault("agent", {})[
             "model_name"
         ] = f"hosted_vllm/{ie_cfg.served_model_name}"
-        self._harbor_trial_config_template["agent"].setdefault("kwargs", {})["api_base"] = f"{self.base_url}/v1"
+        self._harbor_trial_config_template["agent"].setdefault("kwargs", {})["api_base"] = (
+            self.remote.inference_url if self.remote.endpoint else f"{self.base_url}/v1"
+        )
 
         # Step-wise needs per-turn token IDs and logprobs from vLLM via Harbor.
         agent_kwargs = self._harbor_trial_config_template["agent"]["kwargs"]
@@ -364,7 +428,7 @@ class HarborGenerator(GeneratorInterface):
         attempts: Optional[TrialAttempts] = None,
     ) -> HarborTrajectoryOutput:
         """Run a single Harbor trial and return the rollout details plus a trajectory-level reward.
-        Retries on unknown errors; context length errors train with reward=0; agent timeouts mask the trajectory.
+        Remote trial failures are masked; transport and result-contract failures propagate.
         """
         agent_loop_start_time = time.monotonic()
         attempts = attempts if attempts is not None else TrialAttempts()
@@ -386,7 +450,7 @@ class HarborGenerator(GeneratorInterface):
             try:
                 # Create a fresh Trial each attempt so agent state is clean on retry.
                 config = deepcopy(self._harbor_trial_config_template)
-                config["task"] = {"path": prompt}
+                config["task"] = {"path": map_task_path(prompt, self.remote) if self.remote.endpoint else prompt}
                 config["agent"]["kwargs"]["session_id"] = session_id
                 # Forward the salt via llm_kwargs.extra_body -> LiteLLM -> the vLLM request's top-level
                 # `cache_salt` field. vLLM rejects an empty salt, so attach only when set.
@@ -396,15 +460,54 @@ class HarborGenerator(GeneratorInterface):
                     if not isinstance(extra_body, dict):
                         raise TypeError("harbor_trial_config.agent.kwargs.llm_kwargs.extra_body must be a mapping")
                     extra_body["cache_salt"] = cache_salt
-                trial_config = TrialConfig.model_validate(config)
-                trial = await Trial.create(trial_config)
-
                 async with self._rate_limiter:
-                    results = await trial.run()
+                    if self.remote.endpoint:
+                        # The CPU host validates with its own StateFork TrialConfig;
+                        # the older Harbor on the GPU host must not strip search fields.
+                        results = await run_remote_trial(config, self.remote)
+                    else:
+                        if config.get("search", {}).get("enabled") and "search" not in TrialConfig.model_fields:
+                            raise RolloutContractError(
+                                "Local Harbor has no search support; use the StateFork remote server"
+                            )
+                        trial_config = TrialConfig.model_validate(config)
+                        trial = await Trial.create(trial_config)
+                        results = await trial.run()
                 attempts.record(results)
 
-                # Parse exception type
                 exc_type = results.exception_info.exception_type if results.exception_info else None
+                if (
+                    self.remote.endpoint
+                    and exc_type is not None
+                    and not (exc_type == "TmuxSessionEndedError" and results.verifier_result is not None)
+                ):
+                    # Retain existing group masking for ordinary timeouts/startup errors.
+                    # Every other reported trial failure masks only this trajectory.
+                    stop_reason = {
+                        "AgentTimeoutError": "agent_timeout",
+                        "ContextLengthExceededError": "context_length",
+                        "EnvironmentStartTimeoutError": "error",
+                        "SandboxBuildFailedError": "error",
+                        "WaypointShellDeadError": "error",
+                    }.get(exc_type, "environment_error")
+                    logger.warning(
+                        f"{prefix}: {exc_type}: {results.exception_info.exception_message}; "
+                        f"stop_reason={stop_reason} (no retry)."
+                    )
+                    return HarborTrajectoryOutput(
+                        trajectory_id=trajectory_id,
+                        stop_reason=stop_reason,
+                        e2e_time=time.monotonic() - agent_loop_start_time,
+                        exception_info=results.exception_info.model_dump(mode="json"),
+                    )
+                if self.remote.endpoint and results.search_limits_exhausted and exc_type is None:
+                    logger.warning(f"{prefix}: search limits exhausted; masking this trajectory (no retry).")
+                    return HarborTrajectoryOutput(
+                        trajectory_id=trajectory_id,
+                        stop_reason="search_limits_exhausted",
+                        e2e_time=time.monotonic() - agent_loop_start_time,
+                    )
+                # Parse exception type
                 is_context_length_error = exc_type == "ContextLengthExceededError"
                 is_agent_timeout_error = exc_type == "AgentTimeoutError"
 
@@ -425,8 +528,7 @@ class HarborGenerator(GeneratorInterface):
                     reward = float(results.verifier_result.rewards["reward"])
 
                 # Extract rollout details and check for success
-                rollout_details = results.agent_result.rollout_details
-                num_turns = results.agent_result.metadata["n_episodes"]
+                rollout_details, num_turns = extract_rollout(results.agent_result, reward)
 
                 if (
                     rollout_details
@@ -437,8 +539,14 @@ class HarborGenerator(GeneratorInterface):
                     logger.debug(f"{prefix} successful: reward={reward}.")
                     break
                 else:
+                    if self.remote.endpoint:
+                        raise ValueError("Remote Harbor returned no rollout tokens")
                     logger.warning(f"{prefix} failed: empty/missing rollout_details. Results: {results}")
+            except RolloutContractError:
+                raise
             except Exception as e:
+                if self.remote.endpoint:
+                    raise
                 logger.warning(f"{prefix} failed: Error running trial: {e}. Results: {results}")
                 attempts.fail(e)
                 continue

@@ -17,30 +17,12 @@ from skyrl.train.utils import validate_cfg
 from skyrl.train.utils.utils import initialize_ray
 
 from .main_harbor import HARBOR_DEFAULT_CONFIG, HarborExp, HarborSkyRLConfig, _deep_merge
+from skyrl.integration.harbor.forkrl_trainer import ForkRLFullyAsyncTrainer, validate_forkrl_credit_config
 
 
 class HarborFullyAsyncExp(HarborExp):
-    def get_trainer(
-        self,
-        cfg,
-        tracker,
-        tokenizer,
-        train_dataset,
-        eval_dataset,
-        inference_engine_client,
-        generator,
-        colocate_pg,
-    ):
-        return FullyAsyncRayPPOTrainer(
-            cfg=cfg,
-            tracker=tracker,
-            tokenizer=tokenizer,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            inference_engine_client=inference_engine_client,
-            generator=generator,
-            colocate_pg=colocate_pg,
-        )
+    trainer_class = FullyAsyncRayPPOTrainer
+    credit_trainer_class = ForkRLFullyAsyncTrainer
 
 
 @ray.remote(num_cpus=1)
@@ -56,6 +38,7 @@ def main() -> None:
         defaults = yaml.safe_load(f)
     cfg.harbor_trial_config = _deep_merge(defaults, cfg.harbor_trial_config)
 
+    validate_forkrl_credit_config(cfg)
     validate_cfg(cfg)
     if cfg.trainer.algorithm.max_seq_len is None:
         raise ValueError(
