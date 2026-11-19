@@ -478,6 +478,16 @@ def handle_replace_sampling(
     # Determine good UIDs: those with std > 0 (or group size == 1)
     good_uids = set([uid for uid, std in uid2metric_std.items() if std > 0 or n_samples_per_prompt == 1])
     bad_uids = set([uid for uid, std in uid2metric_std.items() if std == 0 and n_samples_per_prompt > 1])
+    if generator_output.get("reward_valid") is not None:
+        kept = zero_variance_filter(
+            rewards,
+            uids,
+            generator_output["loss_masks"],
+            reward_valid=generator_output["reward_valid"],
+            is_last_step=generator_output.get("is_last_step"),
+        )
+        good_uids = {uids[i] for i in kept}
+        bad_uids = set(uids) - good_uids
 
     logger.info(f"Replace sampling: {len(good_uids)} good UIDs out of {len(uid2metric_vals)} total prompts")
 
@@ -562,6 +572,15 @@ def handle_filter_sampling(
 
     # Filter out groups with std == 0 and group size > 1
     kept_uids = [uid for uid, std in uid2metric_std.items() if std > 0 or n_samples_per_prompt == 1]
+    if generator_output.get("reward_valid") is not None:
+        kept = zero_variance_filter(
+            rewards,
+            uids,
+            generator_output["loss_masks"],
+            reward_valid=generator_output["reward_valid"],
+            is_last_step=generator_output.get("is_last_step"),
+        )
+        kept_uids = list(dict.fromkeys(uids[i] for i in kept))
     kept_uids_set = set(kept_uids)
 
     # Filter trajectories based on kept UIDs
@@ -569,6 +588,10 @@ def handle_filter_sampling(
     for idx, traj_uid in enumerate(uids):
         if traj_uid in kept_uids_set:
             kept_traj_idxs.append(idx)
+
+    if not kept_traj_idxs:
+        collected_state.setdefault("num_prompts_in_batch", 0)
+        return generator_output, uids, True, collected_state
 
     # Apply filtering to generator output
     filtered_output = filter_generator_output(generator_output, kept_traj_idxs)
@@ -639,14 +662,15 @@ def zero_variance_filter(
     uids: List[str],
     loss_masks: Optional[List[List[int]]] = None,
     tol: float = 0.0,
+    reward_valid: Optional[List[bool]] = None,
+    is_last_step: Optional[List[bool]] = None,
 ) -> List[int]:
     """
     Given trajectory-level rewards and uids, return the indices of the trajectories to keep.
 
-    A group (trajectories sharing a uid) is dropped only when it has >1 *live* trajectory and their
-    reward spread is within ``tol`` (no GRPO signal); groups with <=1 live trajectory are always kept.
-    A trajectory is "live" if ``sum(loss_mask) > 0`` (or all live when ``loss_masks`` is None) -- so
-    trajectories masked upstream don't make a genuine zero-variance group look varied.
+    With explicit reward validity, compare valid outcomes independently of loss masks. Drop groups
+    with fewer than two valid outcomes, no reward spread, or no trainable valid rollout. Without it,
+    preserve the legacy rule: compare live rollouts and keep groups with <=1 live rollout.
 
     Args:
         rewards: List[float]
@@ -654,23 +678,48 @@ def zero_variance_filter(
         loss_masks: Optional per-trajectory loss masks, used to determine which trajectories are live.
         tol: Two rewards within this absolute tolerance count as equal. 0.0 reproduces exact
             (``np.std > 0``) behavior; set a small value (e.g. 1e-6) for float (LLM-judge) rewards.
+        reward_valid: Per-row outcome validity, repeated on each turn of a rollout.
+        is_last_step: If provided, use one terminal reward per rollout.
 
     Returns:
         List[int]
     """
-    is_live = [True] * len(rewards) if loss_masks is None else [sum(mask) > 0 for mask in loss_masks]
+    if is_last_step is not None:
+        last_indices, trajectory_masks = [], []
+        live = False
+        for i, last in enumerate(is_last_step):
+            live = live or loss_masks is None or any(loss_masks[i])
+            if last:
+                last_indices.append(i)
+                trajectory_masks.append([int(live)])
+                live = False
+        kept = zero_variance_filter(
+            [rewards[i] for i in last_indices],
+            [uids[i] for i in last_indices],
+            trajectory_masks,
+            tol,
+            [reward_valid[i] for i in last_indices] if reward_valid is not None else None,
+        )
+        kept_uids = {uids[last_indices[i]] for i in kept}
+        return [i for i, uid in enumerate(uids) if uid in kept_uids]
 
-    # Group live rewards by UID.
+    is_live = [True] * len(rewards) if loss_masks is None else [any(mask) for mask in loss_masks]
+    included = is_live if reward_valid is None else reward_valid
+
+    # Group outcomes selected for reward statistics by UID.
     uid2live_rewards = defaultdict(list)
-    for uid, reward, live in zip(uids, rewards, is_live):
-        if live:
+    for uid, reward, valid in zip(uids, rewards, included):
+        if valid:
             uid2live_rewards[uid].append(reward)
+    trainable_uids = {uid for uid, live, valid in zip(uids, is_live, included) if live and valid}
 
     def _is_zero_variance(uid: str) -> bool:
         vals = uid2live_rewards.get(uid, [])
+        if reward_valid is not None:
+            return len(vals) < 2 or uid not in trainable_uids or (max(vals) - min(vals)) <= tol
         return len(vals) > 1 and (max(vals) - min(vals)) <= tol
 
-    # Keep everything except groups with >1 live trajectory and no reward spread.
+    # Return every row belonging to a retained group.
     kept_uids_set = {uid for uid in set(uids) if not _is_zero_variance(uid)}
 
     # Return indices of trajectories with kept UIDs
@@ -720,6 +769,7 @@ def validate_generator_output(
             "response_ids",
             "loss_masks",
             "rewards",
+            "reward_valid",
             "rollout_logprobs",
             "stop_reasons",
             "trajectory_ids",
@@ -733,6 +783,18 @@ def validate_generator_output(
                 f"Generator output {key} length must be equal to response_ids length, "
                 f"got {len(generator_output[key])} and {len(generator_output['response_ids'])}"
             )
+
+    reward_valid = generator_output.get("reward_valid")
+    if reward_valid is not None:
+        assert all(isinstance(valid, bool) for valid in reward_valid), "reward_valid must contain booleans"
+        assert all(
+            valid or not any(mask) for valid, mask in zip(reward_valid, generator_output["loss_masks"])
+        ), "Invalid outcomes must be loss masked"
+        if step_wise:
+            last_steps = generator_output["is_last_step"]
+            assert all(
+                last_steps[i - 1] or reward_valid[i] == reward_valid[i - 1] for i in range(1, num_responses)
+            ), "reward_valid must be constant within each rollout"
 
     # make sure that each element of response ids and loss masks are all the same length
     # (and token level rewards if used)

@@ -712,6 +712,8 @@ def pad_training_input_batch(unpadded_batch: TrainingInputBatch, pad_size: int) 
             new_metadata["uids"] = value + [f"pad{i}" for i in range(pad_size)]
         elif key == "is_last_step":
             new_metadata["is_last_step"] = value + [True for _ in range(pad_size)]
+        elif key == "reward_valid":
+            new_metadata[key] = value + [False] * pad_size
         else:
             new_metadata[key] = copy.deepcopy(value)
     new_metadata["pad_size"] = pad_size

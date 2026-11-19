@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
+from typing import Any, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 
 import torch
 
@@ -41,6 +41,9 @@ class GeneratorOutput(TypedDict):
     prompt_token_ids: List[List[int]]
     response_ids: List[List[int]]
     rewards: Union[List[float], List[List[float]]]
+    # Per-row outcome validity, independent of token loss masking. None means all valid.
+    # Repeat the rollout's validity on every turn in step-wise output.
+    reward_valid: NotRequired[Optional[List[bool]]]
     loss_masks: List[List[int]]
     stop_reasons: Optional[List[str]]
     rollout_metrics: Optional[Dict[str, Any]]

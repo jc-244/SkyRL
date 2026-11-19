@@ -1414,6 +1414,7 @@ def compute_grpo_outcome_advantage(
     index: np.ndarray,
     epsilon: float = 1e-6,
     grpo_norm_by_std: bool = True,
+    reward_valid: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -1425,6 +1426,8 @@ def compute_grpo_outcome_advantage(
         - index: np.ndarray (batch_size)
         - epsilon: float
         - grpo_norm_by_std: bool
+        - reward_valid: Optional[Bool[torch.Tensor, "batch_size"]]. Excludes missing
+          outcomes from group statistics; groups with fewer than two valid outcomes get zero advantage.
 
     Returns:
         - advantages: Float[torch.Tensor, "batch_size response_len"]
@@ -1433,6 +1436,11 @@ def compute_grpo_outcome_advantage(
     # this assumes response-level rewards
     scores = token_level_rewards.sum(dim=-1)
 
+    if reward_valid is not None:
+        reward_valid = torch.as_tensor(reward_valid, dtype=torch.bool, device=scores.device)
+        if reward_valid.shape != scores.shape:
+            raise ValueError("reward_valid must contain one flag per rollout")
+
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
@@ -1440,7 +1448,8 @@ def compute_grpo_outcome_advantage(
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
+            if reward_valid is None or reward_valid[i]:
+                id2score[index[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
                 id2mean[idx] = torch.tensor(0.0)
@@ -1451,6 +1460,9 @@ def compute_grpo_outcome_advantage(
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
+            if reward_valid is not None and (not reward_valid[i] or len(id2score[index[i]]) < 2):
+                scores[i] = 0.0
+                continue
             if grpo_norm_by_std:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:

@@ -336,6 +336,12 @@ def concatenate_generator_outputs(
         "trajectory_generation_times": _concat_optional_field(generator_outputs, "trajectory_generation_times"),
         "trajectory_time_splits": _concat_optional_field(generator_outputs, "trajectory_time_splits"),
     }
+    if any(go.get("reward_valid") is not None for go in generator_outputs):
+        result["reward_valid"] = [
+            valid
+            for go in generator_outputs
+            for valid in (go["reward_valid"] if go.get("reward_valid") is not None else [True] * len(go["rewards"]))
+        ]
 
     # propagate additional keys with list values as-is
     additional_keys = [key for key in first if key not in result and isinstance(first[key], list)]
@@ -876,6 +882,7 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
     is_token_level_rewards = isinstance(gen_out["rewards"][0], list)
     has_logprobs = gen_out.get("rollout_logprobs") is not None
     has_stop_reasons = gen_out.get("stop_reasons") is not None
+    reward_valid = gen_out.get("reward_valid")
     has_sample_support = gen_out.get("rollout_sample_support") is not None
 
     # Per-field output accumulators.
@@ -891,6 +898,7 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
 
     # Fields that we only take from the last turn in the merge group
     out_stop_reasons: Optional[List[str]] = [] if has_stop_reasons else None
+    out_reward_valid: Optional[List[bool]] = [] if reward_valid is not None else None
     out_trajectory_ids: list = []
     out_is_last_step: List[bool] = []
 
@@ -917,6 +925,8 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
         out_rewards.append(acc_rewards_tokens if is_token_level_rewards else gen_out["rewards"][last])
         if has_stop_reasons:
             out_stop_reasons.append(gen_out["stop_reasons"][last])
+        if reward_valid is not None:
+            out_reward_valid.append(reward_valid[last])
         out_trajectory_ids.append(gen_out["trajectory_ids"][last])
         out_is_last_step.append(gen_out["is_last_step"][last])
 
@@ -971,6 +981,7 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
         "rewards": out_rewards,
         "loss_masks": out_loss_masks,
         "stop_reasons": out_stop_reasons,
+        "reward_valid": out_reward_valid,
         "rollout_logprobs": out_logprobs,
         "rollout_sample_support": out_sample_support,
         "trajectory_ids": out_trajectory_ids,

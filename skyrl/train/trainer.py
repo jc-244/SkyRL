@@ -1027,6 +1027,8 @@ class RayPPOTrainer:
             },
         )
         training_input.metadata = {"uids": uids}
+        if generator_output.get("reward_valid") is not None:
+            training_input.metadata["reward_valid"] = generator_output["reward_valid"]
         if generator_output.get("is_last_step", None) is not None:
             training_input.metadata["is_last_step"] = generator_output["is_last_step"]
 
@@ -1189,27 +1191,31 @@ class RayPPOTrainer:
         responses: List[List[int]] = generator_output["response_ids"]
         per_token_rewards: List[List[float]] = []
 
-        # Check if rewards are already token-level (List[List[float]]) or response-level (List[float])
-        if rewards and isinstance(rewards[0], list):
-            # Token-level rewards: rewards is List[List[float]]
+        token_rewards = bool(rewards) and isinstance(rewards[0], list)
+        if self.cfg.trainer.algorithm.zero_variance_filter and (
+            not token_rewards or generator_output.get("reward_valid") is not None
+        ):
+            kept_indices_set = set(
+                zero_variance_filter(
+                    [sum(r) for r in rewards] if token_rewards else rewards,
+                    uids,
+                    loss_masks=generator_output["loss_masks"],
+                    tol=self.cfg.trainer.algorithm.zero_variance_filter_tol,
+                    reward_valid=generator_output.get("reward_valid"),
+                    is_last_step=generator_output.get("is_last_step"),
+                )
+            )
+            num_groups = len(set(uids))
+            num_kept_groups = len({uids[i] for i in kept_indices_set})
+            self.all_metrics["reward/num_zero_variance_filtered"] = num_groups - num_kept_groups
+            generator_output["loss_masks"] = [
+                [0] * len(mask) if i not in kept_indices_set else mask
+                for i, mask in enumerate(generator_output["loss_masks"])
+            ]
+
+        if token_rewards:
             per_token_rewards = rewards
         else:
-            if self.cfg.trainer.algorithm.zero_variance_filter:
-                kept_indices_set = set(
-                    zero_variance_filter(
-                        rewards,
-                        uids,
-                        loss_masks=generator_output["loss_masks"],
-                        tol=self.cfg.trainer.algorithm.zero_variance_filter_tol,
-                    )
-                )
-                num_groups = len(set(uids))
-                num_kept_groups = len({uids[i] for i in kept_indices_set})
-                self.all_metrics["reward/num_zero_variance_filtered"] = num_groups - num_kept_groups
-                generator_output["loss_masks"] = [
-                    [0] * len(mask) if i not in kept_indices_set else mask
-                    for i, mask in enumerate(generator_output["loss_masks"])
-                ]
             # Response-level rewards: rewards is List[float], convert to per-token rewards
             for reward, response in zip(rewards, responses):
                 per_token_reward = [0.0] * len(response)
@@ -1249,6 +1255,9 @@ class RayPPOTrainer:
             - `["returns"]`: Float[torch.Tensor, "batch_size response_len"]
         """
         token_level_rewards = data["rewards"]
+        reward_valid = data.metadata.get("reward_valid")
+        if reward_valid is not None:
+            reward_valid = torch.as_tensor(reward_valid, dtype=torch.bool, device=token_level_rewards.device)
 
         if self.cfg.generator.step_wise_trajectories:
             is_last_step = torch.tensor(data.metadata["is_last_step"], dtype=torch.bool)
@@ -1278,6 +1287,7 @@ class RayPPOTrainer:
                 gamma=self.cfg.trainer.algorithm.gamma,
                 lambd=self.cfg.trainer.algorithm.lambd,
                 grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
+                reward_valid=reward_valid[is_last_step] if reward_valid is not None else None,
             )
             traj_ids = (
                 torch.cat([torch.tensor([False], device=is_last_step.device), is_last_step[:-1]]).int().cumsum(dim=0)
@@ -1300,6 +1310,7 @@ class RayPPOTrainer:
                 gamma=self.cfg.trainer.algorithm.gamma,
                 lambd=self.cfg.trainer.algorithm.lambd,
                 grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
+                reward_valid=reward_valid,
             )
         data["returns"] = returns
         data["advantages"] = advantages

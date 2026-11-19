@@ -832,12 +832,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
     def _should_keep_group(self, group: GeneratedOutputGroup) -> bool:
         """Whether a group has reward variance (train on it) vs. is zero-variance (drop it).
 
-        Token-level rewards (``List[List[float]]``) are collapsed to a per-trajectory sum, like the rest
-        of the trainer. Groups with <=1 live trajectory (singletons / mostly masked) are always kept.
+        Token-level rewards (``List[List[float]]``) are summed per row. In step-wise output, only
+        terminal rewards count, matching advantage computation. Explicit reward validity excludes
+        infrastructure failures without excluding scored model failures.
         """
         rewards = group.generator_output["rewards"]
         if rewards and isinstance(rewards[0], list):
-            # Token-level rewards: collapse each trajectory to a scalar sequence reward.
+            # Token-level rewards: collapse each row to a scalar reward.
             seq_rewards = [float(sum(r)) for r in rewards]
         else:
             seq_rewards = rewards
@@ -846,6 +847,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             [group.uid] * len(seq_rewards),
             loss_masks=group.generator_output["loss_masks"],
             tol=self.cfg.trainer.algorithm.zero_variance_filter_tol,
+            reward_valid=group.generator_output.get("reward_valid"),
+            is_last_step=group.generator_output.get("is_last_step"),
         )
         return len(kept_indices) > 0
 
