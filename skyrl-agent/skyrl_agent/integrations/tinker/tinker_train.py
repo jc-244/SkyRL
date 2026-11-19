@@ -20,8 +20,6 @@ from transformers.models.auto.tokenization_auto import AutoTokenizer
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 
-from skyrl_agent import AutoAgentRunner
-
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
 
@@ -158,6 +156,8 @@ class Config:
     resume_exp_name: str = None
 
     skyrl_agent_task_yaml: str = None
+    harbor_trial_config: str | None = None
+    harbor_max_concurrency: int = 8
     dataset_file: str = None  # Path to the training dataset parquet file
     eval_dataset_file: str = None  # Path to the evaluation dataset parquet file
 
@@ -216,6 +216,10 @@ def collate_fn(batch):
 
 
 async def main(config: Config):
+    if config.harbor_trial_config and config.skyrl_agent_task_yaml:
+        raise ValueError("Choose harbor_trial_config or skyrl_agent_task_yaml, not both")
+    if config.harbor_trial_config and (config.group_size is None or config.group_size < 1):
+        raise ValueError("Harbor requires an explicit positive group_size")
     # Set random seed for reproducibility
     set_seed(config.seed)
 
@@ -251,7 +255,9 @@ async def main(config: Config):
 
     # dataset and dataloader
     train_dataset = load_dataset("parquet", data_files=config.dataset_file)["train"]
-    eval_dataset = load_dataset("parquet", data_files=config.eval_dataset_file)["train"]
+    eval_dataset = (
+        load_dataset("parquet", data_files=config.eval_dataset_file)["train"] if config.eval_every > 0 else None
+    )
 
     # Calculate steps per epoch for tracking
     steps_per_epoch = (len(train_dataset) + config.batch_size - 1) // config.batch_size
@@ -293,7 +299,7 @@ async def main(config: Config):
 
     adam_params = types.AdamParams(learning_rate=config.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8)
     skyrl_agent_task_yaml_path = config.skyrl_agent_task_yaml
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name) if not config.harbor_trial_config else None
 
     # training loop
     for policy_iteration_step in range(resume_from_step, config.max_steps):
@@ -315,13 +321,25 @@ async def main(config: Config):
             )
 
         sampling_path = training_client.save_weights_for_sampler(name=f"{policy_iteration_step:06d}").result().path
-        sampling_client = service_client.create_sampling_client(model_path=sampling_path)
+        if config.harbor_trial_config:
+            from examples.train_integrations.harbor.tinker_runner import HarborRunner
 
-        agent_generator = AutoAgentRunner.from_task(
-            skyrl_agent_task_yaml_path, infer_engine=sampling_client, tokenizer=tokenizer
-        )
+            agent_generator = HarborRunner(
+                config.harbor_trial_config,
+                config.model_name,
+                sampling_path,
+                config.group_size,
+                config.harbor_max_concurrency,
+            )
+        else:
+            from skyrl_agent import AutoAgentRunner
 
-        if policy_iteration_step % config.eval_every == 0:
+            sampling_client = service_client.create_sampling_client(model_path=sampling_path)
+            agent_generator = AutoAgentRunner.from_task(
+                skyrl_agent_task_yaml_path, infer_engine=sampling_client, tokenizer=tokenizer
+            )
+
+        if config.eval_every > 0 and policy_iteration_step % config.eval_every == 0:
             eval_dataloader = DataLoader(
                 eval_dataset, batch_size=config.eval_batch_size, shuffle=False, collate_fn=collate_fn
             )
@@ -373,6 +391,9 @@ async def main(config: Config):
 
         actual_batch_size = len(response_ids)
         logger.info(f"Processing {actual_batch_size} rollouts for training")
+        if actual_batch_size == 0:
+            logger.warning("No valid training turns; skipping this batch without an optimizer update")
+            continue
 
         # Compute advantages using GRPO (Group Relative Policy Optimization)
         all_returns = [float(r) for r in traj_rewards_list]

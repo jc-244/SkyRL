@@ -1,0 +1,19 @@
+# Vanilla Harbor on the CPU host; sampling and LoRA updates use hosted Tinker.
+trials_dir: ./harbor-trials
+agent:
+  name: terminus-2
+  override_timeout_sec: 1200
+  kwargs:
+    max_turns: 32
+    enable_summarize: false
+    collect_rollout_details: true
+    llm_backend: tinker
+    temperature: 1.0
+    llm_kwargs:
+      context_limit: 32768
+      max_tokens: 8192  # Harbor Tinker backend default, per model response.
+environment:
+  type: docker
+  delete: true
+verifier:
+  disable: false
